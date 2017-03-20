@@ -47,6 +47,9 @@
 //! ```
 
 extern crate libc;
+extern crate mio;
+extern crate futures;
+extern crate tokio_core;
 
 use unique::Unique;
 use std::marker::PhantomData;
@@ -59,6 +62,10 @@ use std::mem::transmute;
 use std::str;
 use std::fmt;
 use self::Error::*;
+use std::io;
+use mio::{Ready, Poll, PollOpt, Token};
+use mio::event::Evented;
+use mio::unix::EventedFd;
 #[cfg(not(windows))]
 use std::os::unix::io::{RawFd, AsRawFd};
 
@@ -71,7 +78,7 @@ const PCAP_ERROR_NOT_ACTIVATED: i32 = -3;
 const PCAP_ERRBUF_SIZE: usize = 256;
 
 /// An error received from pcap
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Error {
     MalformedError(str::Utf8Error),
     InvalidString,
@@ -80,6 +87,7 @@ pub enum Error {
     TimeoutExpired,
     NoMorePackets,
     InsufficientMemory,
+    IoError(std::io::Error),
     #[cfg(not(windows))]
     InvalidRawFd,
 }
@@ -93,6 +101,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            IoError(ref e) => {
+                write!(f, "io error: {}", e)
+            },
             MalformedError(e) => {
                 write!(f, "pcap returned a string that was not encoded properly: {}", e)
             },
@@ -125,6 +136,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn description(&self) -> &str {
         match *self {
+            IoError(..) => "io error",
             MalformedError(..) => "message from pcap is not encoded properly",
             PcapError(..) => "pcap FFI error",
             InvalidString => "pcap returned an invalid (null) string",
@@ -142,6 +154,12 @@ impl std::error::Error for Error {
             MalformedError(ref e) => Some(e),
             _ => None
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(obj: std::io::Error) -> Error {
+        IoError(obj)
     }
 }
 
@@ -754,6 +772,15 @@ impl<T: Activated + ?Sized> Capture<T> {
         }
     }
 
+    pub fn stream<'a, C: PacketCodec>(&'a mut self, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<'a, T, C>, Error> {
+        unsafe {
+            let mut errbuf = [0i8; PCAP_ERRBUF_SIZE];
+            raw::pcap_setnonblock(*self.handle, 1, errbuf.as_mut_ptr());
+            let fd = raw::pcap_get_selectable_fd(*self.handle);
+            PacketStream::new(self, fd, handle, codec)
+        }
+    }
+
     /// Adds a filter to the capture using the given BPF program string. Internally
     /// this is compiled using `pcap_compile()`.
     ///
@@ -880,6 +907,61 @@ impl Drop for Savefile {
     fn drop(&mut self) {
         unsafe {
             raw::pcap_dump_close(*self.handle);
+        }
+    }
+}
+
+struct SelectableFd {
+    fd: RawFd
+}
+
+impl Evented for SelectableFd {
+    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
+    -> io::Result<()>
+    {
+        EventedFd(&self.fd).register(poll, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt)
+        -> io::Result<()>
+    {
+        EventedFd(&self.fd).reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> io::Result<()> {
+        EventedFd(&self.fd).deregister(poll)
+    }
+}
+
+pub trait PacketCodec {
+    type Type;
+    fn decode<'a>(&mut self, packet: Packet<'a>) -> Result<Self::Type, Error>;
+}
+
+pub struct PacketStream<'a, T: 'a + State + ?Sized, C> {
+    cap: &'a mut Capture<T>,
+    fd: tokio_core::reactor::PollEvented<SelectableFd>,
+    codec: C,
+}
+
+impl<'a, T: State + ?Sized, C: PacketCodec> PacketStream<'a, T, C> {
+    fn new(cap: &'a mut Capture<T>, fd: RawFd, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<'a, T, C>, Error> {
+        Ok(PacketStream{ cap: cap, fd: tokio_core::reactor::PollEvented::new(SelectableFd{fd: fd}, handle)?, codec: codec })
+    }
+}
+
+impl<'a, T: Activated + ?Sized, C: PacketCodec> futures::Stream for PacketStream<'a, T, C> {
+    type Item = C::Type;
+    type Error = Error;
+    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
+        if let futures::Async::NotReady = self.fd.poll_read() {
+            return Err(IoError(io::Error::new(io::ErrorKind::WouldBlock, "would block")))
+        } else {
+            match self.cap.next() {
+                Ok(p) => Ok(futures::Async::Ready(Some(self.codec.decode(p)?))),
+                Err(TimeoutExpired) => Ok(futures::Async::NotReady),
+                Err(e) => Err(e),
+            }
         }
     }
 }

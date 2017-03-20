@@ -738,10 +738,10 @@ extern "C" {
      -> ::libc::c_int;
     pub fn pcap_setdirection(arg1: *mut pcap_t, arg2: pcap_direction_t)
      -> ::libc::c_int;
-    // pub fn pcap_getnonblock(arg1: *mut pcap_t, arg2: *mut ::libc::c_char)
-    //  -> ::libc::c_int;
-    // pub fn pcap_setnonblock(arg1: *mut pcap_t, arg2: ::libc::c_int,
-    //                         arg3: *mut ::libc::c_char) -> ::libc::c_int;
+    pub fn pcap_getnonblock(arg1: *mut pcap_t, arg2: *mut ::libc::c_char)
+     -> ::libc::c_int;
+    pub fn pcap_setnonblock(arg1: *mut pcap_t, arg2: ::libc::c_int,
+                            arg3: *mut ::libc::c_char) -> ::libc::c_int;
     pub fn pcap_sendpacket(arg1: *mut pcap_t, arg2: *const u_char,
                            arg3: ::libc::c_int) -> ::libc::c_int;
     // pub fn pcap_statustostr(arg1: ::libc::c_int) -> *const ::libc::c_char;
@@ -801,7 +801,7 @@ extern "C" {
     //  -> *mut ::libc::c_char;
     // pub fn bpf_dump(arg1: *const Struct_bpf_program, arg2: ::libc::c_int)
     //  -> ();
-    // pub fn pcap_get_selectable_fd(arg1: *mut pcap_t) -> ::libc::c_int;
+    pub fn pcap_get_selectable_fd(arg1: *mut pcap_t) -> ::libc::c_int;
 }
 
 

@@ -14,6 +14,9 @@ build = "build.rs"
 
 [dependencies]
 libc = "0.2"
+mio = "*"
+futures = "*"
+tokio-core = "*"
 
 [dev-dependencies]
 tempdir = "0.3"
