@@ -49,6 +49,7 @@
 extern crate libc;
 extern crate mio;
 extern crate futures;
+#[macro_use]
 extern crate tokio_core;
 
 use unique::Unique;
@@ -772,7 +773,22 @@ impl<T: Activated + ?Sized> Capture<T> {
         }
     }
 
-    pub fn stream<'a, C: PacketCodec>(&'a mut self, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<'a, T, C>, Error> {
+    fn next_noblock<'a>(&'a mut self,  fd: &mut tokio_core::reactor::PollEvented<SelectableFd>) -> Result<Packet<'a>, Error> {
+        if let futures::Async::NotReady = fd.poll_read() {
+            return Err(IoError(io::Error::new(io::ErrorKind::WouldBlock, "would block")))
+        } else {
+            return match self.next() {
+                Ok(p) => Ok(p),
+                Err(TimeoutExpired) => {
+                    fd.need_read();
+                    Err(IoError(io::Error::new(io::ErrorKind::WouldBlock, "would block")))
+                },
+                Err(e) => Err(e)
+            }
+        }
+    }
+
+    pub fn stream<C: PacketCodec>(self, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<T, C>, Error> {
         unsafe {
             let mut errbuf = [0i8; PCAP_ERRBUF_SIZE];
             raw::pcap_setnonblock(*self.handle, 1, errbuf.as_mut_ptr());
@@ -938,31 +954,32 @@ pub trait PacketCodec {
     fn decode<'a>(&mut self, packet: Packet<'a>) -> Result<Self::Type, Error>;
 }
 
-pub struct PacketStream<'a, T: 'a + State + ?Sized, C> {
-    cap: &'a mut Capture<T>,
+pub struct PacketStream<T: State + ?Sized, C> {
+    cap: Capture<T>,
     fd: tokio_core::reactor::PollEvented<SelectableFd>,
     codec: C,
 }
 
-impl<'a, T: State + ?Sized, C: PacketCodec> PacketStream<'a, T, C> {
-    fn new(cap: &'a mut Capture<T>, fd: RawFd, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<'a, T, C>, Error> {
+impl<T: Activated + ?Sized, C: PacketCodec> PacketStream<T, C> {
+    fn new(cap: Capture<T>, fd: RawFd, handle: &tokio_core::reactor::Handle, codec: C) -> Result<PacketStream<T, C>, Error> {
         Ok(PacketStream{ cap: cap, fd: tokio_core::reactor::PollEvented::new(SelectableFd{fd: fd}, handle)?, codec: codec })
     }
 }
 
-impl<'a, T: Activated + ?Sized, C: PacketCodec> futures::Stream for PacketStream<'a, T, C> {
+
+impl<'a, T: Activated + ?Sized, C: PacketCodec> futures::Stream for PacketStream<T, C> {
     type Item = C::Type;
     type Error = Error;
     fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
-        if let futures::Async::NotReady = self.fd.poll_read() {
-            return Err(IoError(io::Error::new(io::ErrorKind::WouldBlock, "would block")))
-        } else {
-            match self.cap.next() {
-                Ok(p) => Ok(futures::Async::Ready(Some(self.codec.decode(p)?))),
-                Err(TimeoutExpired) => Ok(futures::Async::NotReady),
-                Err(e) => Err(e),
-            }
-        }
+        let p = match self.cap.next_noblock(&mut self.fd) {
+            Ok(t) => t,
+            Err(IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(futures::Async::NotReady)
+            },
+            Err(e) => return Err(e.into())
+        };
+        let frame = try!(self.codec.decode(p));
+        Ok(futures::Async::Ready(Some(frame)))
     }
 }
 
